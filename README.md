@@ -25,13 +25,6 @@ cd regis_olt_python
 ```
 APP_PORT=8000
 FLASK_DEBUG=true #production = false
-
-OLT_HOST=192.168.1.22
-OLT_PORT=22
-OLT_USER=root
-OLT_PASS=zte123
-MAX_WORKERS=6
-VLAN_PROFILE_PREFIX=customer
 ```
 
 
