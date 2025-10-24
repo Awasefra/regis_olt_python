@@ -1,12 +1,15 @@
 from flask import Flask, request, render_template_string, jsonify
 import threading, os, csv
-from regis_onu_zte import main as run_registration, progress_dict
+from regis_onu_zte import progress_dict, main as run_regis_main
 
 app = Flask(__name__)
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 LOG_CSV = "hasil_registrasi.csv"
+
+# 🔹 status global proses (register/config/done)
+current_phase = {"phase": "idle"}
 
 
 @app.route("/")
@@ -100,7 +103,24 @@ def index():
         th { background: #2b2b2b; color: #fff; }
         tr:nth-child(even) { background: #181818; }
         #status { margin-top: 15px; font-weight: bold; }
-        hr { border: 0; border-top: 1px solid var(--border); margin: 25px 0; }
+
+        #results-area{
+          margin-top:10px;
+          max-height:500px;
+          overflow-y:auto;
+          border:1px solid var(--border);
+          border-radius:8px;
+        }
+        #results-area table{ width:100%; border-collapse:collapse; }
+        #results-area th, #results-area td{
+          border:1px solid var(--border);
+          padding:6px;
+          font-size:13px;
+        }
+        #results-area th{
+          position:sticky; top:0;
+          background:#2b2b2b; color:#fff;
+        }
         footer {
           text-align: center;
           color: #777;
@@ -139,12 +159,18 @@ def index():
           <input type="text" name="vlan_prefix" placeholder="vlan" required>
         </div>
         <div>
-          <label>Max Workers (1-8)</label>
-          <input type="number" name="max_workers" min="1" max="8" value="6" required>
+        <label>Worker Mode</label>
+          <input type="text" value="Auto (1 for Register, 2 for Config)" readonly>
         </div>
-        <div class="full-width">
-          <label>File CSV ONU</label>
+        <div  class="full-width">
+          <label>File CSV ONU (1 port saja)</label>
           <input type="file" name="file" accept=".csv" required>
+        </div>
+        <div  class="full-width">
+          <label>
+            <input type="checkbox" name="auto_write" value="true" style="width:auto;vertical-align:middle;margin-right:6px;">
+            Jalankan <b>write</b> otomatis setelah registrasi (commit konfigurasi)
+          </label>
         </div>
         <div class="full-width">
           <button type="submit">🚀 Upload & Jalankan</button>
@@ -152,19 +178,14 @@ def index():
       </form>
 
       <div id="status"></div>
-
       <hr>
-      <button onclick="loadPending()">📄 Lihat Pending ONU</button>
-      <div id="pending-area"></div>
-
+      <div id="progress-area"></div>
       <hr>
       <div class="legend">
-        <b>Keterangan:</b>
-        <span style="background:var(--success);"></span>Running
-        <span style="background:var(--wait);"></span>Waiting
-        <span style="background:var(--done);"></span>Finished
+        <span style="background:var(--wait)"></span> Pending
+        <span style="background:var(--success)"></span> Registered/Success
+        <span style="background:#f44336"></span> Error
       </div>
-      <div id="progress-area"></div>
 
       <hr>
       <h3>📘 Hasil Registrasi</h3>
@@ -183,51 +204,48 @@ def index():
         document.getElementById("status").innerHTML = "⏳ Mengupload dan memulai proses...";
         try {
           const res = await fetch("/upload", { method: "POST", body: formData });
-          const text = await res.text();
-          document.getElementById("status").innerHTML = text;
+          const data = await res.json();
+          if (data.error) {
+            document.getElementById("status").innerHTML = data.error;
+          } else {
+            document.getElementById("status").innerHTML = data.success;
+          }
         } catch (err) {
           document.getElementById("status").innerHTML = "❌ Gagal upload: " + err;
         }
       });
 
-      async function loadPending() {
-        const res = await fetch("/pending");
-        const text = await res.text();
-        document.getElementById("pending-area").innerHTML = text;
-      }
-
       async function refreshProgress() {
         const res = await fetch('/progress');
         const data = await res.json();
         let html = "";
-        let totalDone = 0;
-        let totalTotal = 0;
         for (const [port, v] of Object.entries(data)) {
           const pct = (v.total ? (v.done / v.total * 100) : 0).toFixed(0);
-          let color = 'var(--success)';
-          if (v.status === 'WAITING') color = 'var(--wait)';
-          else if (v.status === 'FINISHED') color = 'var(--done)';
-          totalDone += v.done;
-          totalTotal += v.total;
           html += `<div><b>${port}</b> - ${v.status} (${v.done}/${v.total})</div>
-                   <div class='bar'><div class='fill' style='width:${pct}%; background:${color}'></div></div>`;
-        }
-        if (totalTotal > 0) {
-          const pctAll = (totalDone / totalTotal * 100).toFixed(0);
-          html = `<h3>Total Progress: ${totalDone}/${totalTotal} (${pctAll}%)</h3>
-                  <div class='bar'><div class='fill' style='width:${pctAll}%; background:var(--accent);'></div></div><br>` + html;
+                   <div class='bar'><div class='fill' style='width:${pct}%; background:var(--accent);'></div></div>`;
         }
         document.getElementById("progress-area").innerHTML = html;
         setTimeout(refreshProgress, 2000);
       }
-      refreshProgress();
 
       async function loadResults() {
-        const res = await fetch('/results');
+        const scroller = document.getElementById("results-area");
+        const prevTop = scroller.scrollTop;
+        const prevHeight = scroller.scrollHeight;
+        const atBottom = prevTop + scroller.clientHeight >= prevHeight - 5;
+
+        const res = await fetch("/results", { cache: "no-store" });
         const html = await res.text();
-        document.getElementById("results-area").innerHTML = html;
+        scroller.innerHTML = html;
+
+        const newHeight = scroller.scrollHeight;
+        if (atBottom) scroller.scrollTop = scroller.scrollHeight;
+        else scroller.scrollTop = prevTop + (newHeight - prevHeight);
+
         setTimeout(loadResults, 5000);
       }
+
+      refreshProgress();
       loadResults();
       </script>
     </body>
@@ -239,46 +257,47 @@ def index():
 def upload():
     file = request.files.get("file")
     if not file:
-        return "❌ Tidak ada file diupload", 400
+        return jsonify({"error": "❌ Tidak ada file diupload."}), 400
 
     path = os.path.join(UPLOAD_FOLDER, "data_onu.csv")
     file.save(path)
 
+    # ✅ Validasi hanya 1 port di CSV
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = list(csv.DictReader(f))
+    ports = {r["interface"].strip() for r in reader if r.get("interface")}
+    if len(ports) != 1:
+        return jsonify({
+            "error": f"❌ File harus berisi 1 port saja, ditemukan {len(ports)} port: {', '.join(ports)}"
+        }), 400
+        
+    auto_write = request.form.get("auto_write") == "true"
+    
     olt_config = {
         "host": request.form.get("olt_host"),
         "port": int(request.form.get("olt_port")),
         "user": request.form.get("olt_user"),
         "pass": request.form.get("olt_pass"),
         "vlan_prefix": request.form.get("vlan_prefix"),
-        "max_workers": min(8, max(1, int(request.form.get("max_workers", 6))))
+        "max_workers": 1,
+        "auto_write": auto_write,
     }
 
-    t = threading.Thread(target=run_registration, args=(path, olt_config), daemon=True)
+    def threaded_run():
+        try:
+            current_phase["phase"] = "register"
+            run_regis_main(path, olt_config, mode="register")
+            current_phase["phase"] = "config"
+            run_regis_main(path, olt_config, mode="config")
+            current_phase["phase"] = "done"
+        except Exception as e:
+            current_phase["phase"] = f"error: {e}"
+
+    t = threading.Thread(target=threaded_run, daemon=True)
     t.start()
-    return f"✅ File diterima. Proses registrasi dimulai ke OLT {olt_config['host']}:{olt_config['port']} (Thread: {olt_config['max_workers']})."
-
-
-@app.route("/pending")
-def pending():
-    path = os.path.join(UPLOAD_FOLDER, "data_onu.csv")
-    if not os.path.exists(path):
-        return "❌ Belum ada file diupload.", 400
-
-    from regis_onu_zte import load_done_keys
-    done = load_done_keys(LOG_CSV)
-
-    with open(path, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-
-    pending = [r for r in rows if (r["interface"].strip(), r["onu_id"].strip(), r["sn"].strip()) not in done]
-    if not pending:
-        return "<b>✅ Semua baris sudah success di log. Tidak ada pending ONU.</b>"
-
-    html = "<table><tr><th>Interface</th><th>ONU ID</th><th>SN</th><th>Nama</th></tr>"
-    for p in pending:
-        html += f"<tr><td>{p['interface']}</td><td>{p['onu_id']}</td><td>{p['sn']}</td><td>{p['name']}</td></tr>"
-    html += "</table>"
-    return html
+    return jsonify({
+        "success": f"✅ File diterima. Menjalankan registrasi untuk {list(ports)[0]} di OLT {olt_config['host']}."
+    })
 
 
 @app.route("/progress")
@@ -296,9 +315,20 @@ def results():
         return "<i>Belum ada hasil registrasi.</i>"
 
     html = "<table><tr>" + "".join([f"<th>{h}</th>" for h in rows[0].keys()]) + "</tr>"
-    for r in rows[-50:]:
-        html += "<tr>" + "".join([f"<td>{v}</td>" for v in r.values()]) + "</tr>"
+    for r in rows:
+        status = r.get("status", "").lower()
+        color = (
+            "var(--wait)" if status == "pending"
+            else "var(--success)" if status in ["registered", "success"]
+            else "#f44336" if status == "error"
+            else "var(--text)"
+        )
+        html += "<tr>" + "".join([
+            f"<td style='color:{color};font-weight:bold'>{v}</td>" if k == "status" else f"<td>{v}</td>"
+            for k, v in r.items()
+        ]) + "</tr>"
     html += "</table>"
+
     return html
 
 
