@@ -1,0 +1,26 @@
+# Virtual environment
+venv/
+ENV/
+*.pyc
+__pycache__/
+
+# Uploads & logs
+uploads/
+hasil_registrasi.csv
+*.log
+
+# Environment
+.env
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Backup / temp
+*.bak
+*.tmp
