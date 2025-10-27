@@ -8,7 +8,7 @@ READ_WINDOW_SEC       = 1       # waktu baca tiap baris
 LOG_CSV               = "hasil_registrasi.csv"
 
 BATCH_SIZE            = 32       # jumlah ONU per batch
-BATCH_DELAY_SEC       = 5        # jeda antar batch
+BATCH_DELAY_SEC       = 2        # jeda antar batch
 MAX_COMMIT_WAIT_SEC   = 180      # max tunggu commit
 COMMIT_POLL_SEC       = 10       # interval polling commit
 
@@ -237,8 +237,8 @@ def wait_until_committed(shell, interface, expected_ids: set, timeout=MAX_COMMIT
     # 🔁 Re-check tambahan setelah timeout
     missing = expected_ids - last_seen
     if missing:
-        print(f"⚠️ Timeout, {len(missing)} ONU belum muncul. Tunggu 2 menit lalu re-check...")
-        time.sleep(120)
+        print(f"⚠️ Timeout, {len(missing)} ONU belum muncul. Tunggu 30 lalu re-check...")
+        time.sleep(30)
         send_block(shell, "enable")
         send_block(shell, "terminal length 0")
         out = send_block(shell, f"show gpon onu state {interface}", delay=1, read_window=20)
@@ -322,7 +322,7 @@ def process_register(interface, rows, log_lock, cfg):
                     print("⚠️ 'write' dilewati (manual mode). Jalankan 'write' di CLI OLT setelah verifikasi.")
 
                 cli.close()
-                time.sleep(2)
+                time.sleep(0.5)
                 cli, sh = ssh_connect(cfg)
                 enter_config(sh)
                 batch_counter = 0
@@ -330,7 +330,7 @@ def process_register(interface, rows, log_lock, cfg):
         # --- Verifikasi commit ---
         expected_ids = {r["onu_id"].strip() for r in rows}
         print(f"🕒 Semua batch terkirim. Tunggu OLT commit port {interface}...\n")
-        time.sleep(2)
+        time.sleep(0.5)
         committed = wait_until_committed(sh, interface, expected_ids)
 
         # --- Update hasil akhir ---
@@ -373,6 +373,7 @@ def process_config(interface, rows, log_lock, cfg, parallel_workers=None):
     - >36 ONU → 2 worker
     - Auto-reconnect kalau SSH drop
     - Delay antar koneksi agar OLT tidak menolak session
+    - Tambahan: simpan log CLI dan error ke olt_debug.log
     """
     status_map = load_status_map(LOG_CSV)
     to_config = [r for r in rows if status_map.get(_key_of(r)) == "registered"]
@@ -396,6 +397,11 @@ def process_config(interface, rows, log_lock, cfg, parallel_workers=None):
 
     # 🔹 Bagi ONU merata per worker
     chunks = [to_config[i::parallel_workers] for i in range(parallel_workers)]
+
+    # 🔒 Lock global untuk menulis log CLI
+    global debug_lock
+    if "debug_lock" not in globals():
+        debug_lock = threading.Lock()
 
     def worker_thread(worker_id, subset):
         print(f"🧩 Worker-{worker_id} mulai, {len(subset)} ONU")
@@ -422,12 +428,22 @@ def process_config(interface, rows, log_lock, cfg, parallel_workers=None):
                 block = build_config_block(r, cfg["vlan_prefix"])
                 out = send_block(sh, block)
 
+                # 🪵 Simpan hasil CLI ke log
+                with debug_lock:
+                    with open("olt_debug.log", "a", encoding="utf-8") as dbg:
+                        dbg.write(f"\n--- CONFIG {interface} ONU {r['onu_id']} (Worker-{worker_id}) ---\n{out}\n")
+
                 if "%Error" in out or "Invalid" in out:
                     status, msg = "error", "Error during config"
                 else:
                     status, msg = "success", "Configured OK"
 
             except Exception as e:
+                # 🪵 Simpan error ke log
+                with debug_lock:
+                    with open("olt_debug.log", "a", encoding="utf-8") as dbg:
+                        dbg.write(f"\n❌ Worker-{worker_id} Exception ONU {r['onu_id']}:\n{str(e)}\n")
+
                 # jika koneksi drop, reconnect dan ulang perintah
                 print(f"⚠️ Worker-{worker_id}: Exception saat ONU {r['onu_id']} → {e}")
                 if "WinError 10054" in str(e) or "closed" in str(e).lower():
@@ -435,12 +451,19 @@ def process_config(interface, rows, log_lock, cfg, parallel_workers=None):
                     try:
                         block = build_config_block(r, cfg["vlan_prefix"])
                         out = send_block(sh, block)
+
+                        # 🪵 Simpan hasil CLI retry
+                        with debug_lock:
+                            with open("olt_debug.log", "a", encoding="utf-8") as dbg:
+                                dbg.write(f"\n--- RETRY CONFIG {interface} ONU {r['onu_id']} (Worker-{worker_id}) ---\n{out}\n")
+
                         status, msg = "success", "Configured after reconnect"
                     except Exception as e2:
                         status, msg = "error", f"Retry failed: {e2}"
                 else:
                     status, msg = "error", f"Exception: {e}"
 
+            # update hasil ke CSV
             append_log(log_lock, LOG_CSV, {
                 "interface": r["interface"],
                 "onu_id": r["onu_id"],
@@ -463,7 +486,7 @@ def process_config(interface, rows, log_lock, cfg, parallel_workers=None):
         t = threading.Thread(target=worker_thread, args=(i, subset))
         t.start()
         threads.append(t)
-        time.sleep(2)  # jeda antar koneksi agar OLT tidak overload
+        time.sleep(0.5)  # jeda antar koneksi agar OLT tidak overload
 
     for t in threads:
         t.join()
