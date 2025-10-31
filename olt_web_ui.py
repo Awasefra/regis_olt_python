@@ -309,14 +309,19 @@ def progress():
 def results():
     if not os.path.exists(LOG_CSV):
         return "<i>Belum ada hasil registrasi.</i>"
+
     with open(LOG_CSV, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+        rows = [r for r in csv.DictReader(f) if r]  # skip baris kosong
+
     if not rows:
         return "<i>Belum ada hasil registrasi.</i>"
 
     html = "<table><tr>" + "".join([f"<th>{h}</th>" for h in rows[0].keys()]) + "</tr>"
+
     for r in rows:
-        status = r.get("status", "").lower()
+        if not r:  # skip baris kosong/null
+            continue
+        status = (r.get("status") or "").lower()  # aman walau None
         color = (
             "var(--wait)" if status == "pending"
             else "var(--success)" if status in ["registered", "success"]
@@ -327,9 +332,10 @@ def results():
             f"<td style='color:{color};font-weight:bold'>{v}</td>" if k == "status" else f"<td>{v}</td>"
             for k, v in r.items()
         ]) + "</tr>"
-    html += "</table>"
 
+    html += "</table>"
     return html
+
 
 
 if __name__ == "__main__":

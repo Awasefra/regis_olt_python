@@ -103,17 +103,27 @@ def enter_config(shell):
 
 # ----------------- BLOCK BUILDER (REGISTER/CONFIG) -----------
 def build_register_block(rows, onu_type="ALL"):
+    """
+    Membangun perintah registrasi ONU berdasarkan daftar CSV.
+    Asumsi: ONU sudah dihapus sebelumnya (no onu 1–128 dilakukan di awal).
+    """
     if not rows:
         return ""
+
     interface = rows[0]["interface"].strip()
     cmds = [f"interface {interface}"]
+
     for r in rows:
         onu_id = r["onu_id"].strip()
         sn = r["sn"].strip()
-        cmds.append(f"no onu {onu_id}")
+        name = r.get("name", "")
         cmds.append(f"onu {onu_id} type {onu_type} sn {sn}")
+        if name:
+            cmds.append(f"name {onu_id} {name}")  # opsional: kalau mau kasih label nama
+
     cmds.append("exit")
     return "\n".join(cmds)
+
 
 def build_config_block(row, vlan_prefix):
     interface = row["interface"].strip()
@@ -255,15 +265,39 @@ def wait_until_committed(shell, interface, expected_ids: set, timeout=MAX_COMMIT
 # ----------------------- PROSES INTI -------------------------
 def process_register(interface, rows, log_lock, cfg):
     """
-    Optimized OLT-safe version:
+    Optimized OLT-safe version (dengan conditional unregister):
+    - Unregister 1–128 hanya dijalankan jika interface belum ada di hasil CSV
     - Register per batch (default 32)
-    - Tiap ±96 ONU lakukan auto-flush ('write' + reconnect)
-    - Cegah buffer overflow (kasus 110 ONU hilang)
+    - Auto flush tiap ±96 ONU
     - Retry SSH jika drop
     """
+    # 🔍 Cek apakah interface ini sudah pernah tercatat di hasil_registrasi.csv
+    need_unreg = True
+    if os.path.exists(LOG_CSV):
+        with open(LOG_CSV, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("interface", "").strip() == interface:
+                    need_unreg = False
+                    break
+
     cli, sh = ssh_connect(cfg)
     try:
         enter_config(sh)
+
+        # --- STEP 1: Conditional Unregister ---
+        if need_unreg:
+            print(f"🚮 Menghapus seluruh ONU di {interface} (1–128)...")
+            unreg_cmds = [f"interface {interface}"] + [f"no onu {i}" for i in range(1, 129)] + ["exit"]
+            unreg_block = "\n".join(unreg_cmds)
+            out = send_block(sh, unreg_block)
+            with open("olt_debug.log", "a", encoding="utf-8") as dbg:
+                dbg.write(f"\n--- UNREGISTER {interface} (1–128) ---\n{out}\n")
+            print("✅ Semua ONU dihapus dari konfigurasi OLT.")
+            time.sleep(2)  # beri waktu OLT proses
+        else:
+            print(f"⚙️ Lewati unreg — {interface} sudah pernah tercatat di hasil_registrasi.csv")
+
+        # --- STEP 2: Proses Registrasi (sama seperti sebelumnya) ---
         with progress_lock:
             progress_dict[interface] = {"done": 0, "total": len(rows), "status": "RUNNING"}
 
@@ -291,11 +325,11 @@ def process_register(interface, rows, log_lock, cfg):
                 print(f"🔁 Reconnect & ulang batch {batch_no}...")
                 out = send_block(sh, block)
 
-            # Simpan log CLI
+            # Log CLI output
             with open("olt_debug.log", "a", encoding="utf-8") as dbg:
                 dbg.write(f"\n--- REGISTER {interface} BATCH {batch_no} ---\n{out}\n")
 
-            # Update status CSV
+            # Update CSV status
             for r in batch:
                 append_log(log_lock, LOG_CSV, {
                     "interface": r["interface"],
@@ -306,34 +340,29 @@ def process_register(interface, rows, log_lock, cfg):
                     "message": "Command sent, waiting for OLT commit"
                 })
 
-            # 🔸 Delay antar batch
             print(f"✅ Batch {batch_no}/{total_batches} selesai dikirim, jeda {BATCH_DELAY_SEC}s...\n")
             time.sleep(BATCH_DELAY_SEC)
 
-            # 🔸 Auto flush tiap 96 ONU (hindari 110-limit bug)
             if batch_counter >= 96:
                 print("💾 Flush buffer OLT (write + reconnect agar commit sempurna)...")
-               # Setelah commit check selesai
                 if cfg.get("auto_write", False):
-                    print("💾 Menyimpan konfigurasi ke OLT (write)...")
-                    send_block(sh, "write", delay=1, read_window=10)
+                    out = send_block(sh, "write", delay=1, read_window=10)
+                    with open("olt_debug.log", "a", encoding="utf-8") as dbg:
+                        dbg.write(f"\n--- WRITE {interface} ---\n{out}\n")
                     print("✅ Konfigurasi berhasil disimpan ke flash.")
                 else:
                     print("⚠️ 'write' dilewati (manual mode). Jalankan 'write' di CLI OLT setelah verifikasi.")
-
                 cli.close()
                 time.sleep(0.5)
                 cli, sh = ssh_connect(cfg)
                 enter_config(sh)
                 batch_counter = 0
 
-        # --- Verifikasi commit ---
         expected_ids = {r["onu_id"].strip() for r in rows}
         print(f"🕒 Semua batch terkirim. Tunggu OLT commit port {interface}...\n")
         time.sleep(0.5)
         committed = wait_until_committed(sh, interface, expected_ids)
 
-        # --- Update hasil akhir ---
         for r in rows:
             onu_id = r["onu_id"].strip()
             if onu_id in committed:
@@ -362,8 +391,15 @@ def process_register(interface, rows, log_lock, cfg):
         with progress_lock:
             progress_dict[interface]["status"] = "FINISHED"
 
-
-
+def wait_prompt(shell, timeout=2):
+    start = time.time()
+    while time.time() - start < timeout:
+        if shell.recv_ready():
+            data = shell.recv(65535).decode(errors="ignore")
+            if "(config)" in data:
+                return True
+        time.sleep(0.1)
+    return False
 
 
 def process_config(interface, rows, log_lock, cfg, parallel_workers=None):
@@ -414,11 +450,13 @@ def process_config(interface, rows, log_lock, cfg, parallel_workers=None):
                     cli.close()
                 cli, sh = ssh_connect(cfg)
                 enter_config(sh)
+                time.sleep(1)  # 🛠️ beri waktu 1 detik agar prompt stabil
                 print(f"🔁 Worker-{worker_id}: SSH reconnected.")
             except Exception as e:
                 print(f"❌ Worker-{worker_id}: Gagal reconnect SSH ({e}), retry 5s...")
                 time.sleep(5)
                 safe_connect()
+
 
         # koneksi awal
         safe_connect()
@@ -427,6 +465,8 @@ def process_config(interface, rows, log_lock, cfg, parallel_workers=None):
             try:
                 block = build_config_block(r, cfg["vlan_prefix"])
                 out = send_block(sh, block)
+                wait_prompt(sh)
+                time.sleep(0.3)
 
                 # 🪵 Simpan hasil CLI ke log
                 with debug_lock:
@@ -451,6 +491,8 @@ def process_config(interface, rows, log_lock, cfg, parallel_workers=None):
                     try:
                         block = build_config_block(r, cfg["vlan_prefix"])
                         out = send_block(sh, block)
+                        wait_prompt(sh)
+                        time.sleep(0.3)
 
                         # 🪵 Simpan hasil CLI retry
                         with debug_lock:
